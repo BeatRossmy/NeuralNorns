@@ -17,6 +17,7 @@
 engine.name = 'PolyPerc'
 hs = include('lib/halfsecond')
 
+lattice = require("lattice")
 tabutil = require("tabutil")
 musicutil = require("musicutil")
 
@@ -107,30 +108,18 @@ selected = {
   notes = {}
 }
 
-tick = 0
-
-sequencer = function ()
-  tick = 0
-  while true do
-    clock.sync(1/4)
-    arpeggio = nn:calc_from(latent_vector,"decoder")
-    tick = util.wrap(tick+1,1,64)
-    local sub_tick = util.wrap(tick,1,8)
-    
-    local step = sequence[math.ceil(tick/8)]
-    local arp = step.arp and step.arp or arpeggio
-    
-    playing = {}
-    
-    for y,note in ipairs(step.notes) do
-      local i = (y-1)*8+sub_tick
-      if arp[i]>0.2 then
-        engine.hz(musicutil.note_num_to_freq(59+note))
-        table.insert(playing,note)
-      end
+on_tick = function (t)
+  arpeggio = nn:calc_from(latent_vector,"decoder")
+  local sub_tick = util.wrap(t,1,8)
+  local step = sequence[math.ceil(t/8)]
+  local arp = step.arp and step.arp or arpeggio
+  playing = {}
+  for y,note in ipairs(step.notes) do
+    local i = (y-1)*8+sub_tick
+    if arp[i]>0.2 then
+      engine.hz(musicutil.note_num_to_freq(59+note))
+      table.insert(playing,note)
     end
-    
-    dirty = true
   end
 end
  
@@ -207,6 +196,24 @@ ui_update = function ()
 end
 
 function init()
+  main_lattice = lattice:new{
+    auto = true,
+    ppqn = 96
+  }
+  tick = 1
+  sprocket_pattern = main_lattice:new_sprocket{
+    action = function(t) 
+      tick = ((main_lattice.transport-1)/24)+1
+      tick = util.wrap(tick,1,64)
+      on_tick(tick)
+      dirty = true
+    end,
+    division = 1/16,
+    enabled = false
+  }
+  main_lattice:start()
+  sprocket_pattern:toggle()
+  
   for _,step in ipairs(sequence) do
     step.notes = {}
   end
@@ -248,11 +255,17 @@ function init()
   
   hs.init()
   
-  clock.run(sequencer)
   clock.run(ui_update)
 end
 
 function key(n,z)
+  if n==3 and z==1 then
+    if main_lattice.enabled then
+      main_lattice:stop()
+    else
+      main_lattice:start()
+    end
+  end
   dirty = true
 end
 
@@ -286,6 +299,7 @@ function redraw()
     local y = 5-math.ceil(i/8) -- invert, so that kick is bottom row
     screen.rect(21+x*9,y*9,6,6)
     l = util.linlin(0,1,1,15,val)
+    if (x==tick) then l = util.linlin(0,1,5,15,val) end
     screen.level(math.floor(l))
     screen.stroke()
   end
@@ -304,6 +318,10 @@ function redraw()
     screen.move(68,52)
     screen.text("s: "..s)
   end
+  
+  screen.level(1)
+  screen.move(4,58)
+  screen.text(main_lattice.enabled and "k3: pause" or "k3: play")
   
   screen.update()
   

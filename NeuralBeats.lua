@@ -16,10 +16,65 @@
 engine.name = 'Ack'
 local Ack = require 'ack/lib/ack'
 
+lattice = require("lattice")
 tabutil = require("tabutil")
 JSON = include("lib/JSON")
 
+include("lib/helper")
+
 g = grid.connect()
+
+key_listener = new_key_listener()
+
+key_listener.on_press = function (x,y)
+  -- snapshots
+  if (x>=1 and x<=16 and y==8) then
+    selected.snapshots[x] = true
+    interpolate_snapshots()
+  -- pattern
+  elseif (x>=5 and x<=12 and y>=1 and y<=4) then
+    local i = (4-y)*8+(x-4) -- invert
+    print("set:",i)
+    pattern[i] = pattern[i] >= 0.4 and 0 or 1
+    pattern = nn:calc(pattern)
+    latent_vector = nn:calc_to(pattern,"decoder")
+  -- latent vector
+  elseif (x>latent_left and x<=latent_right and y==6) then
+    
+    selected.latent = x-latent_left
+    print(selected.latent)
+  end
+end
+
+key_listener.on_release = function (x,y)
+  --snapshots
+  if (x>=1 and x<=16 and y==8) then
+    selected.snapshots[x] = nil
+    interpolate_snapshots()
+  -- latent vector
+  elseif (x>latent_left and x<=latent_right and y==6) then
+    local _x = x-latent_left
+    if (_x==selected.latent) then selected.latent = nil end
+  end
+end
+
+key_listener.on_click = function (x,y)
+  -- snapshots
+  if (x>=1 and x<=16 and y==8) then
+    if snapshots[x]==nil and key_listener:count_hold(function (x,y) return y==8 end)==0 then
+      print("new snapshot")
+      snapshots[x] = {table.unpack(latent_vector)}
+    end
+  end
+end
+
+interpolate_snapshots = function ()
+  local hold_cells = key_listener:get_hold(function (x,y) return y==8 end)
+  local vectors = {}
+  for _,c in pairs(hold_cells) do table.insert(vectors,snapshots[c[1]]) end
+  local mean = calculate_mean_vector(vectors)
+  pattern = (mean) and nn:calc_from(mean,"decoder") or nn:calc_from({table.unpack(latent_vector)},"decoder")
+end
 
 Sequential = include("lib/Sequential")
 nn = Sequential.new()
@@ -53,92 +108,21 @@ selected = {
   latent_dim = nil,
   snapshots = {}
 }
-
-count_hold = function ()
-  local n = 0
-  for i=1,16 do
-    n = selected.snapshots[i] and (n+1) or n
-  end
-  return n
-end
-
-get_hold = function ()
-  local hold = {}
-  for i=1,16 do
-    if snapshots[i] and selected.snapshots[i] then
-      table.insert(hold,snapshots[i])
-    end
-  end
-  return hold
-end
-
-mean_vector = function (vectors)
-  if type(vectors) ~= "table" or #vectors==0 then return nil end
-  local mean = {}
-  for i=1,#vectors[1]do
-    for _,v in ipairs(vectors) do
-      mean[i] = mean[i] and mean[i] or 0
-      mean[i] = mean[i] + v[i]
-    end
-    mean[i] = mean[i]/#vectors
-  end
-  return mean
-end
  
 g.key = function (x,y,z)
-  local latent_left = 8-math.floor(#latent_vector/2)
-  local latent_right = latent_left+#latent_vector
-  -- pattern
-  if (z==1 and x>=5 and x<=12 and y>=1 and y<=4) then
-    local i = (4-y)*8+(x-4) -- invert
-    print("set:",i)
-    pattern[i] = pattern[i] >= 0.4 and 0 or 1
-    pattern = nn:calc(pattern)
-    latent_vector = nn:calc_to(pattern,"decoder")
-    
-  -- latent vector
-  elseif (x>latent_left and x<=latent_right and y==6) then
-    local _x = x-latent_left
-    selected.latent = (z==1 and selected.latent==nil) and _x or nil
-    
-  -- snapshots
-  elseif (x>=1 and x<=16 and y==8) then
-    if (z==1) then
-      selected.snapshots[x] = util.time()
-    else
-      local delta = util.time() - selected.snapshots[x]
-      if delta<0.5 and count_hold()==1 then
-        snapshots[x] = {table.unpack(latent_vector)}
-      end
-      selected.snapshots[x] = nil
-    end
-    
-    -- interpolate selected snapshots
-    local vectors = get_hold()
-    local mean = mean_vector(vectors)
-    pattern = (mean) and nn:calc_from(mean,"decoder") or nn:calc_from(latent_vector,"decoder")
-  end
-  
+  key_listener:handle(x,y,z)
   dirty = true
 end
 
-sequencer = function ()
-  tick = 0
-  while true do
-    clock.sync(1/4)
-    tick = util.wrap(tick+1,1,8)
-    
-    for ins=1,4 do
-      local i = (ins-1)*8+tick
-      if pattern[i]>0.4 then
-        if ins==3 then
-          engine.kill(4-1)
-        end
-        engine.trig(ins-1)
+on_tick = function (t)
+  for ins=1,4 do
+    local i = (ins-1)*8+t
+    if pattern[i]>0.4 then
+      if ins==3 then
+        engine.kill(4-1)
       end
+      engine.trig(ins-1)
     end
-    
-    dirty = true
   end
 end
 
@@ -154,8 +138,29 @@ ui_update = function ()
 end
 
 function init()
+  main_lattice = lattice:new{
+    auto = true,
+    ppqn = 96
+  }
+  tick = 1
+  sprocket_pattern = main_lattice:new_sprocket{
+    action = function(t) 
+      tick = ((main_lattice.transport-1)/24)+1
+      tick = util.wrap(tick,1,8)
+      on_tick(tick)
+      dirty = true
+    end,
+    division = 1/16,
+    enabled = false
+  }
+  main_lattice:start()
+  sprocket_pattern:toggle()
+  
   model = JSON.get_table(_path.code.."NeuralNorns/default_models/beat_model.json") 
   load_model(model)
+  
+  latent_left = 8-math.floor(#latent_vector/2)
+  latent_right = latent_left+#latent_vector
   
   params:add_file("model", "model")
   params:set_action("model", function (path)
@@ -163,36 +168,42 @@ function init()
     load_model(model)
   end)
   
-  local def_samples = {
-    "kick.wav",
-    "snare.wav",
-    "hh.wav",
-    "oh.wav"
-  }
+  local def_samples = {"808-BD.wav", "808-SD.wav", "808-CH.wav", "808-OH.wav", "808-LT.wav", "808-MT.wav", "808-HT.wav", "808-CY.wav"}
   for ch=1,4 do
     Ack.add_channel_params(ch)
-    params:set(ch.."_sample",_path.data.."NeuralNorns/sounds/"..def_samples[ch])
+    params:set(ch.."_sample",_path.audio.."common/808/"..def_samples[ch])
   end
   
-  clock.run(sequencer)
   clock.run(ui_update)
 end
 
 function key(n,z)
+  local hold__snapshots = key_listener:get_hold(function(x,y) return y==8 end)
+  if (n==2) and z==1 then
+    for _,c in pairs(hold__snapshots) do
+      snapshots[c[1]] = nil
+    end
+  elseif n==3 and z==1 then
+    if main_lattice.enabled then
+      main_lattice:stop()
+    else
+      main_lattice:start()
+    end
+  end
   dirty = true
 end
 
 function enc(n,d)
-  if n==1 then
+  if not selected.latent then
     for i,_ in ipairs(latent_vector) do
       latent_vector[i] = math.random()
     end
-    pattern = nn:calc_from(latent_vector,"decoder")
   elseif selected.latent then
     d = d*0.025
     latent_vector[selected.latent] = util.clamp(latent_vector[selected.latent]+d,0,1)
-    pattern = nn:calc_from(latent_vector,"decoder")
   end
+  
+  pattern = nn:calc_from({table.unpack(latent_vector)},"decoder")
   
   dirty = true
 end
@@ -205,9 +216,14 @@ function redraw()
     local y = 5-math.ceil(i/8) -- invert, so that kick is bottom row
     screen.rect(21+x*9,y*9,6,6)
     l = util.linlin(0,1,1,15,val)
+    if (x==tick) then l = util.linlin(0,1,5,15,val) end
     screen.level(math.floor(l))
     screen.stroke()
   end
+  
+  screen.level(1)
+  screen.move(4,58)
+  screen.text(main_lattice.enabled and "k3: pause" or "k3: play")
   
   screen.update()
   
@@ -228,11 +244,10 @@ function grid_redraw()
     g:led(4 + x,y,math.floor(l))
   end
   
-  local latent_left = 8-math.floor(#latent_vector/2)
-  local latent_right = latent_left+#latent_vector
   -- latent vector
   for i,val in ipairs(latent_vector) do
     l = util.linlin(0,1,3,15,val)
+    if i==selected.latent then l = util.linlin(0,1,10,15,val) end
     g:led(latent_left+ i,6,math.floor(l))
   end
   
